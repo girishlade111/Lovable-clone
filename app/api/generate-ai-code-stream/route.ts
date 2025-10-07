@@ -10,6 +10,7 @@ import { executeSearchPlan, formatSearchResultsForAI, selectTargetFile } from '@
 import { FileManifest } from '@/types/file-manifest';
 import type { ConversationState, ConversationMessage, ConversationEdit } from '@/types/conversation';
 import { appConfig } from '@/config/app.config';
+import { validateModelProvider, getProviderFromModel } from '@/lib/api-validation';
 
 const groq = createGroq({
   apiKey: process.env.GROQ_API_KEY,
@@ -78,10 +79,22 @@ export async function POST(request: NextRequest) {
     
     console.log('[generate-ai-code-stream] Received request:');
     console.log('[generate-ai-code-stream] - prompt:', prompt);
+    console.log('[generate-ai-code-stream] - model:', model);
     console.log('[generate-ai-code-stream] - isEdit:', isEdit);
     console.log('[generate-ai-code-stream] - context.sandboxId:', context?.sandboxId);
     console.log('[generate-ai-code-stream] - context.currentFiles:', context?.currentFiles ? Object.keys(context.currentFiles) : 'none');
     console.log('[generate-ai-code-stream] - currentFiles count:', context?.currentFiles ? Object.keys(context.currentFiles).length : 0);
+    
+    // Validate API key for the requested model
+    const validation = validateModelProvider(model);
+    if (!validation.isValid) {
+      console.error('[generate-ai-code-stream] API key validation failed:', validation.error);
+      return NextResponse.json({ 
+        success: false, 
+        error: validation.error,
+        type: 'api_key_error'
+      }, { status: 400 });
+    }
     
     // Initialize conversation state if not exists
     if (!global.conversationState) {

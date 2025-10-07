@@ -6,6 +6,7 @@ import { createGoogleGenerativeAI } from '@ai-sdk/google';
 import { generateObject } from 'ai';
 import { z } from 'zod';
 import type { FileManifest } from '@/types/file-manifest';
+import { validateModelProvider } from '@/lib/api-validation';
 
 const groq = createGroq({
   apiKey: process.env.GROQ_API_KEY,
@@ -57,6 +58,17 @@ export async function POST(request: NextRequest) {
     console.log('[analyze-edit-intent] Prompt:', prompt);
     console.log('[analyze-edit-intent] Model:', model);
     console.log('[analyze-edit-intent] Manifest files count:', manifest?.files ? Object.keys(manifest.files).length : 0);
+    
+    // Validate API key for the requested model
+    const validation = validateModelProvider(model);
+    if (!validation.isValid) {
+      console.error('[analyze-edit-intent] API key validation failed:', validation.error);
+      return NextResponse.json({ 
+        success: false, 
+        error: validation.error,
+        type: 'api_key_error'
+      }, { status: 400 });
+    }
     
     if (!prompt || !manifest) {
       return NextResponse.json({

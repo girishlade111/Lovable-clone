@@ -1,4 +1,4 @@
-# Open Lovable
+# Lade Coder
 
 Chat with AI to build React apps instantly. An example app made by the [Firecrawl](https://firecrawl.dev/?ref=open-lovable-github) team. For a complete cloud solution, check out [Lovable.dev ❤️](https://lovable.dev/).
 
@@ -10,8 +10,8 @@ Chat with AI to build React apps instantly. An example app made by the [Firecraw
 
 1. **Clone & Install**
 ```bash
-git clone https://github.com/mendableai/open-lovable.git
-cd open-lovable
+git clone https://github.com/girishlade111/lade-coder.git
+cd lade-coder
 npm install
 ```
 

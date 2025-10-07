@@ -47,6 +47,18 @@ export async function POST(request: NextRequest) {
         console.log(`[install-packages] Successfully reconnected to sandbox ${sandboxId}`);
       } catch (error) {
         console.error(`[install-packages] Failed to reconnect to sandbox:`, error);
+        
+        // Check if it's a "sandbox not found" error
+        const errorMessage = (error as Error).message || '';
+        if (errorMessage.includes('not found') || errorMessage.includes('404')) {
+          return NextResponse.json({
+            success: false,
+            error: 'Sandbox not found',
+            needsRecreation: true,
+            details: `Sandbox ${sandboxId} was not found. It may have expired. Please create a new sandbox.`
+          }, { status: 404 });
+        }
+        
         return NextResponse.json({ 
           success: false, 
           error: `Failed to reconnect to sandbox: ${(error as Error).message}` 

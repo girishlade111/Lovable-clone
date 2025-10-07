@@ -326,6 +326,26 @@ export async function POST(request: NextRequest) {
       } catch (reconnectError) {
         console.error(`[apply-ai-code-stream] Failed to reconnect to sandbox ${sandboxId}:`, reconnectError);
         
+        // Check if it's a "sandbox not found" error
+        const errorMessage = (reconnectError as Error).message || '';
+        if (errorMessage.includes('not found') || errorMessage.includes('404') || errorMessage.toLowerCase().includes('sandbox') && errorMessage.toLowerCase().includes('found')) {
+          return NextResponse.json({
+            success: false,
+            error: 'Sandbox not found',
+            needsRecreation: true,
+            results: {
+              filesCreated: [],
+              packagesInstalled: [],
+              commandsExecuted: [],
+              errors: [`Sandbox ${sandboxId} was not found and may have expired`]
+            },
+            explanation: parsed.explanation,
+            structure: parsed.structure,
+            parsedFiles: parsed.files,
+            message: `Sandbox ${sandboxId} was not found. It may have expired. Please create a new sandbox.`
+          }, { status: 404 });
+        }
+        
         // If reconnection fails, we'll still try to return a meaningful response
         return NextResponse.json({
           success: false,

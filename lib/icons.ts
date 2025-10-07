@@ -13,6 +13,7 @@ export {
   BsFolder2Open 
 } from 'react-icons/bs';
 
+// Use more stable imports for Simple Icons to avoid HMR issues
 export { 
   SiJavascript, 
   SiReact, 

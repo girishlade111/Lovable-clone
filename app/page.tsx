@@ -3,6 +3,7 @@
 import { useState, useEffect, useRef } from 'react';
 import { useSearchParams, useRouter } from 'next/navigation';
 import { appConfig } from '@/config/app.config';
+import { useAvailableModels } from '@/lib/use-available-models';
 import { Button } from '@/components/ui/button';
 import { Textarea } from '@/components/ui/textarea';
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
@@ -62,8 +63,13 @@ export default function AISandboxPage() {
   const [aiEnabled] = useState(true);
   const searchParams = useSearchParams();
   const router = useRouter();
+  
+  // Use the hook for dynamic model configuration
+  const modelConfig = useAvailableModels();
   const [aiModel, setAiModel] = useState(() => {
     const modelParam = searchParams.get('model');
+    // Use static config initially to prevent hydration mismatch
+    // Will be updated by useEffect when modelConfig loads
     return appConfig.ai.availableModels.includes(modelParam || '') ? modelParam! : appConfig.ai.defaultModel;
   });
   const [urlOverlayVisible, setUrlOverlayVisible] = useState(false);
@@ -136,6 +142,27 @@ export default function AISandboxPage() {
     lastProcessedPosition: 0
   });
 
+  // Update model when validation completes
+  useEffect(() => {
+    if (!modelConfig.isLoading) {
+      const modelParam = searchParams.get('model');
+      const requestedModel = modelParam && modelConfig.availableModels.includes(modelParam) 
+        ? modelParam 
+        : modelConfig.defaultModel;
+      
+      if (requestedModel !== aiModel) {
+        setAiModel(requestedModel);
+        // Update URL to reflect the actual available model
+        const newParams = new URLSearchParams(searchParams.toString());
+        newParams.set('model', requestedModel);
+        if (sandboxData?.sandboxId) {
+          newParams.set('sandbox', sandboxData.sandboxId);
+        }
+        router.replace(`/?${newParams.toString()}`);
+      }
+    }
+  }, [modelConfig.isLoading, modelConfig.availableModels, modelConfig.defaultModel, searchParams, aiModel, router, sandboxData?.sandboxId]);
+  
   // Clear old conversation data on component mount and create/restore sandbox
   useEffect(() => {
     let isMounted = true;
@@ -356,10 +383,34 @@ export default function AISandboxPage() {
       if (data.active && data.healthy && data.sandboxData) {
         setSandboxData(data.sandboxData);
         updateStatus('Sandbox active', true);
+        
+        // If sandbox was reconnected, update iframe
+        if (data.sandboxData.reconnected && iframeRef.current) {
+          console.log('[checkSandboxStatus] Sandbox was reconnected, updating iframe');
+          setTimeout(() => {
+            if (iframeRef.current) {
+              iframeRef.current.src = data.sandboxData.url;
+            }
+          }, 1000);
+        }
+      } else if (data.needsRecreation) {
+        // Sandbox not found - needs recreation
+        console.log('[checkSandboxStatus] Sandbox needs recreation, creating new one...');
+        setSandboxData(null);
+        updateStatus('Creating new sandbox...', false);
+        
+        try {
+          await createSandbox(true);
+          addChatMessage('Sandbox was expired/not found. Created a new sandbox automatically.', 'system');
+        } catch (error: any) {
+          console.error('[checkSandboxStatus] Failed to recreate sandbox:', error);
+          addChatMessage(`Failed to recreate sandbox: ${error.message}`, 'system');
+          updateStatus('Error', false);
+        }
       } else if (data.active && !data.healthy) {
         // Sandbox exists but not responding
         updateStatus('Sandbox not responding', false);
-        // Optionally try to create a new one
+        addChatMessage('Sandbox is not responding. You may need to create a new one.', 'system');
       } else {
         setSandboxData(null);
         updateStatus('No sandbox', false);
@@ -496,7 +547,36 @@ Tip: I automatically detect and install npm packages from your code imports (lik
       });
       
       if (!response.ok) {
-        throw new Error(`Failed to apply code: ${response.statusText}`);
+        // Try to parse error response for better handling
+        let errorData: any = null;
+        try {
+          errorData = await response.json();
+        } catch {
+          // If parsing fails, use status text
+        }
+        
+        // Check if sandbox needs recreation
+        if (errorData?.needsRecreation || (response.status === 404 && errorData?.error === 'Sandbox not found')) {
+          console.log('[applyGeneratedCode] Sandbox needs recreation, creating new sandbox...');
+          addChatMessage('Sandbox was not found (may have expired). Creating a new sandbox...', 'system');
+          
+          try {
+            // Clear the current application state
+            setCodeApplicationState(null);
+            
+            // Create new sandbox
+            await createSandbox(true);
+            addChatMessage('New sandbox created! Please try your request again.', 'system');
+            return;
+          } catch (sandboxError: any) {
+            addChatMessage(`Failed to create new sandbox: ${sandboxError.message}`, 'system');
+            return;
+          }
+        }
+        
+        // For other errors, throw with appropriate message
+        const errorMessage = errorData?.error || `Failed to apply code: ${response.statusText}`;
+        throw new Error(errorMessage);
       }
       
       // Handle streaming response
@@ -2024,13 +2104,30 @@ Tip: I automatically detect and install npm packages from your code imports (lik
       });
       
       if (!scrapeResponse.ok) {
-        throw new Error(`Scraping failed: ${scrapeResponse.status}`);
+        const errorData = await scrapeResponse.text();
+        console.error('[cloneWebsite] Scrape response error:', errorData);
+        let errorMessage = `Scraping failed: ${scrapeResponse.status}`;
+        
+        try {
+          const errorJson = JSON.parse(errorData);
+          errorMessage = errorJson.error || errorMessage;
+        } catch {
+          // Keep the default error message if parsing fails
+        }
+        
+        throw new Error(errorMessage);
       }
       
       const scrapeData = await scrapeResponse.json();
       
       if (!scrapeData.success) {
+        console.error('[cloneWebsite] Scrape data error:', scrapeData);
         throw new Error(scrapeData.error || 'Failed to scrape website');
+      }
+      
+      if (!scrapeData.content || scrapeData.content.length < 10) {
+        console.warn('[cloneWebsite] Very short content received:', scrapeData.content?.length);
+        addChatMessage('⚠️ Warning: Very little content was scraped from the website. The site might have anti-scraping protection or be JavaScript-heavy.', 'system');
       }
       
       addChatMessage(`Scraped ${scrapeData.content.length} characters from ${url}`, 'system');
@@ -2395,26 +2492,52 @@ Focus on the key sections and content, making it clean and modern while preservi
       try {
         // Scrape the website
         let url = homeUrlInput.trim();
+        console.log('[homeScreen] Processing URL:', { original: homeUrlInput, trimmed: url });
+        
         if (!url.match(/^https?:\/\//i)) {
           url = 'https://' + url;
         }
         
+        console.log('[homeScreen] Final URL for scraping:', url);
+        
         // Screenshot is already being captured in parallel above
+        
+        const requestBody = { url };
+        console.log('[homeScreen] Request body:', JSON.stringify(requestBody));
         
         const scrapeResponse = await fetch('/api/scrape-url-enhanced', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ url })
+          body: JSON.stringify(requestBody)
         });
         
+        console.log('[homeScreen] Scrape response status:', scrapeResponse.status);
+        
         if (!scrapeResponse.ok) {
-          throw new Error('Failed to scrape website');
+          const errorData = await scrapeResponse.text();
+          console.error('[homeScreen] Scrape response error:', errorData);
+          let errorMessage = `Failed to scrape website: ${scrapeResponse.status}`;
+          
+          try {
+            const errorJson = JSON.parse(errorData);
+            errorMessage = errorJson.error || errorMessage;
+          } catch {
+            // Keep the default error message if parsing fails
+          }
+          
+          throw new Error(errorMessage);
         }
         
         const scrapeData = await scrapeResponse.json();
         
         if (!scrapeData.success) {
-          throw new Error(scrapeData.error || 'Failed to scrape website');
+          console.error('[homeScreen] Scrape data error:', scrapeData);
+          throw new Error(scrapeData.error || 'Failed to scrape website content');
+        }
+        
+        if (!scrapeData.content || scrapeData.content.length < 10) {
+          console.warn('[homeScreen] Very short content received:', scrapeData.content?.length);
+          // Don't throw error here, just warn - let the AI work with what it has
         }
         
         setUrlStatus(['Website scraped successfully!', 'Generating React app...']);
@@ -2793,13 +2916,13 @@ Focus on the key sections and content, making it clean and modern.`;
           <div className="absolute top-0 left-0 right-0 z-20 px-6 py-4 flex items-center justify-between animate-[fadeIn_0.8s_ease-out]">
             <ThemeLogo />
             <a 
-              href="https://github.com/mendableai/open-lovable" 
+              href="https://github.com/girishlade111" 
               target="_blank" 
               rel="noopener noreferrer"
               className="inline-flex items-center gap-2 bg-[#36322F] text-white px-3 py-2 rounded-[10px] text-sm font-medium [box-shadow:inset_0px_-2px_0px_0px_#171310,_0px_1px_6px_0px_rgba(58,_33,_8,_58%)] hover:translate-y-[1px] hover:scale-[0.98] hover:[box-shadow:inset_0px_-1px_0px_0px_#171310,_0px_1px_3px_0px_rgba(58,_33,_8,_40%)] active:translate-y-[2px] active:scale-[0.97] active:[box-shadow:inset_0px_1px_1px_0px_#171310,_0px_1px_2px_0px_rgba(58,_33,_8,_30%)] transition-all duration-200"
             >
               <FiGithub className="w-4 h-4" />
-              <span>Use this template</span>
+              <span>View Source</span>
             </a>
           </div>
           
@@ -2809,8 +2932,8 @@ Focus on the key sections and content, making it clean and modern.`;
               {/* Firecrawl-style Header */}
               <div className="text-center">
                 <h1 className="text-[2.5rem] lg:text-[3.8rem] text-center text-[#36322F] font-semibold tracking-tight leading-[0.9] animate-[fadeIn_0.8s_ease-out]">
-                  <span className="hidden md:inline">Open Lovable</span>
-                  <span className="md:hidden">Open Lovable</span>
+                  <span className="hidden md:inline">Lade Coder</span>
+                  <span className="md:hidden">Lade Coder</span>
                 </h1>
                 <motion.p 
                   className="text-base lg:text-lg max-w-lg mx-auto mt-2.5 text-zinc-500 text-center text-balance"
@@ -2843,7 +2966,7 @@ Focus on the key sections and content, making it clean and modern.`;
                       }
                     }}
                     placeholder=" "
-                    aria-placeholder="https://firecrawl.dev"
+                    aria-placeholder="https://example.com"
                     className="h-[3.25rem] w-full resize-none focus-visible:outline-none focus-visible:ring-orange-500 focus-visible:ring-2 rounded-[18px] text-sm text-[#36322F] px-4 pr-12 border-[.75px] border-border bg-white"
                     style={{
                       boxShadow: '0 0 0 1px #e3e1de66, 0 1px 2px #5f4a2e14, 0 4px 6px #5f4a2e0a, 0 40px 40px -24px #684b2514',
@@ -2858,7 +2981,7 @@ Focus on the key sections and content, making it clean and modern.`;
                     }`}
                   >
                     <span className="text-[#605A57]/50" style={{ fontFamily: 'monospace' }}>
-                      https://firecrawl.dev
+                      https://example.com
                     </span>
                   </div>
                   <button
@@ -2990,11 +3113,14 @@ Focus on the key sections and content, making it clean and modern.`;
                     boxShadow: '0 0 0 1px #e3e1de66, 0 1px 2px #5f4a2e14'
                   }}
                 >
-                  {appConfig.ai.availableModels.map(model => (
+                  {modelConfig.availableModels.map(model => (
                     <option key={model} value={model}>
                       {appConfig.ai.modelDisplayNames[model] || model}
                     </option>
-                  ))}
+                  ))}  
+                  {modelConfig.isLoading && (
+                    <option disabled>Loading available models...</option>
+                  )}
                 </select>
               </div>
             </div>
@@ -3022,11 +3148,14 @@ Focus on the key sections and content, making it clean and modern.`;
             }}
             className="px-3 py-1.5 text-sm bg-white border border-gray-300 rounded-[10px] focus:outline-none focus:ring-2 focus:ring-[#36322F] focus:border-transparent"
           >
-            {appConfig.ai.availableModels.map(model => (
+            {modelConfig.availableModels.map(model => (
               <option key={model} value={model}>
                 {appConfig.ai.modelDisplayNames[model] || model}
               </option>
             ))}
+            {modelConfig.isLoading && (
+              <option disabled>Loading available models...</option>
+            )}
           </select>
           <Button 
             variant="code"
